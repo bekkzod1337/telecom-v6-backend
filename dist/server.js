@@ -65,6 +65,9 @@ const bonusBasePrices = {
     'Bonus Super Lux': 77001,
     'Bonus Ideal Plus': 85001
 };
+const tariffPrices = {
+    'Super Lux': 77000
+};
 function text(value) { return value == null ? '' : String(value); }
 function number(value) {
     const source = String(value ?? '').replace(/\s/g, '').replace(',', '.');
@@ -75,14 +78,27 @@ function number(value) {
 }
 function calculate(row) {
     const tariff = text(row['Тарифный план']).trim();
-    const payment = bonusBasePrices[tariff] ?? number(row['Сумма оплат в день подключения']);
+    const currentPayment = number(row['Сумма оплат в день подключения']);
+    const status = text(row['Статус заявки']).trim().toLocaleLowerCase();
+    const waitingForPayment = status === 'ожидание оплаты';
+    const tariffPayment = bonusBasePrices[tariff] ?? tariffPrices[tariff];
+    const payment = tariffPayment !== undefined && (bonusBasePrices[tariff] !== undefined || (waitingForPayment && currentPayment <= 0))
+        ? tariffPayment : currentPayment;
     const rate = number(row['Комиссия %']);
     const net = payment / 1.12;
     const commission = tariff === 'Bonus Super Salom' ? 8000
         : tariff === 'Bonus Super Lux' || tariff === 'Bonus Ideal Plus' ? 12000
             : net * rate;
-    return { ...row, 'Сумма оплат в день подключения': payment, 'Сумма без НДС': net, 'Комиссия %': rate, 'Сумма комиссии': commission,
-        'Комиссия без НДС': commission / 1.12, 'К выплате с коэффициентом': commission * 1.06 };
+    return { ...row, 'Сумма оплат в день подключения': payment, 'Сумма без НДС': Math.trunc(net), 'Комиссия %': rate, 'Сумма комиссии': Math.trunc(commission),
+        'Комиссия без НДС': Math.trunc(commission / 1.12), 'К выплате с коэффициентом': Math.trunc(commission * 1.06) };
+}
+function monthOf(value) {
+    const match = text(value).match(/(?:^|\D)(\d{1,2})[./-]\d{1,2}[./-]\d{4}/);
+    return match ? Number(match[1]) : new Date(text(value)).getMonth() + 1 || 1;
+}
+function percent(value) {
+    const parsed = number(value);
+    return parsed > 1 ? parsed / 100 : parsed;
 }
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.post('/api/reestr/import', upload.single('file'), async (req, res) => {
@@ -105,19 +121,49 @@ app.post('/api/reestr/import', upload.single('file'), async (req, res) => {
             result['№'] = index + 1;
             result['Komissiya %'] = tariffDefaults[text(result['Тарифный план'])] ?? 0.6;
             return calculate(result);
-        });
+        }).filter((row) => text(row['Статус заявки']).trim().toLocaleLowerCase() !== 'ожидание оплаты');
         const loginValues = [...new Set(rows.map((row) => text(row['Логин']).trim()).filter(Boolean))];
         const dealerByLogin = new Map();
+        const settingsByLogin = new Map();
         if (loginValues.length > 0) {
-            const dealerResult = await pool.query(`SELECT dl.login, d.name
+            const dealerResult = await pool.query(`SELECT dl.login, d.name, dl.base_rate, dl.quarter_rate_1, dl.quarter_rate_2, dl.quarter_rate_3, dl.actual_count, d.plan_count
          FROM dealer_logins dl
          INNER JOIN dealers d ON d.id = dl.dealer_id
          WHERE dl.login = ANY($1::text[])`, [loginValues]);
-            for (const item of dealerResult.rows)
+            for (const item of dealerResult.rows) {
                 dealerByLogin.set(item.login, item.name);
+                settingsByLogin.set(item.login, {
+                    baseRate: Number(item.base_rate), quarterRates: [Number(item.quarter_rate_1), Number(item.quarter_rate_2), Number(item.quarter_rate_3)],
+                    plan: Number(item.plan_count), actual: Number(item.actual_count)
+                });
+            }
         }
-        for (const row of rows)
-            row['Diler nomi'] = dealerByLogin.get(text(row['Логин']).trim()) ?? '';
+        const facts = new Map();
+        for (const row of rows) {
+            const login = text(row['Логин']).trim();
+            const dealer = dealerByLogin.get(login);
+            if (dealer)
+                facts.set(dealer, (facts.get(dealer) ?? 0) + number(row['Сони'] || 1));
+        }
+        for (const row of rows) {
+            const login = text(row['Логин']).trim();
+            const dealer = dealerByLogin.get(login) ?? '';
+            const settings = settingsByLogin.get(login);
+            const fact = facts.get(dealer) ?? settings?.actual ?? 0;
+            const rate = settings && settings.plan > 0 && fact >= settings.plan
+                ? settings.quarterRates[(monthOf(row['Дата подключения']) - 1) % 3] : settings?.baseRate;
+            row['Diler nomi'] = dealer;
+            row['Asl foiz'] = settings?.baseRate ?? null;
+            row['1-oy foiz'] = settings?.quarterRates[0] ?? null;
+            row['2-oy foiz'] = settings?.quarterRates[1] ?? null;
+            row['3-oy foiz'] = settings?.quarterRates[2] ?? null;
+            row['Fakt'] = settings ? fact : null;
+            row['Plan'] = settings?.plan ?? null;
+            if (rate !== undefined) {
+                row['Комиссия %'] = rate;
+                Object.assign(row, calculate(row));
+            }
+        }
         res.json({ sheetName, columns: [...headers, 'Сумма без НДС', 'Комиссия %', 'Сумма комиссии', 'Комиссия без НДС', 'К выплате с коэффициентом'], rows });
     }
     catch (error) {
@@ -127,7 +173,13 @@ app.post('/api/reestr/import', upload.single('file'), async (req, res) => {
 app.post('/api/dealers', async (req, res) => {
     const { entries } = req.body;
     const validEntries = Array.isArray(entries)
-        ? entries.map((entry) => ({ login: entry.login?.trim() ?? '', dealer: entry.dealer?.trim() ?? '' }))
+        ? entries.map((entry) => ({
+            login: entry.login?.trim() ?? '',
+            dealer: entry.dealer?.trim() ?? '',
+            baseRate: entry.baseRate,
+            rates: entry.rates,
+            plan: entry.plan
+        }))
             .filter((entry) => entry.login && entry.dealer)
         : [];
     if (validEntries.length === 0) {
@@ -138,8 +190,23 @@ app.post('/api/dealers', async (req, res) => {
         await client.query('BEGIN');
         const savedEntries = [];
         for (const entry of validEntries) {
-            const dealerResult = await client.query('INSERT INTO dealers(name, company) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET company=EXCLUDED.company RETURNING id,name,company', [entry.dealer, entry.dealer]);
-            await client.query('INSERT INTO dealer_logins(login,dealer_id) VALUES($1,$2) ON CONFLICT(login) DO UPDATE SET dealer_id=EXCLUDED.dealer_id', [entry.login, dealerResult.rows[0].id]);
+            const dealerResult = await client.query(`INSERT INTO dealers(name, company, plan_count) VALUES($1,$2,$3)
+         ON CONFLICT(name) DO UPDATE SET company=EXCLUDED.company, plan_count=EXCLUDED.plan_count
+         RETURNING id,name,company`, [entry.dealer, entry.dealer, number(entry.plan ?? 0)]);
+            const rates = entry.rates ?? [];
+            const quarterRates = [rates[0] ?? 0.6, rates[1] ?? 0.65, rates[2] ?? 0.7];
+            await client.query(`INSERT INTO dealer_logins(login,dealer_id,base_rate,quarter_rate_1,quarter_rate_2,quarter_rate_3,actual_count,plan_count)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT(login) DO UPDATE SET dealer_id=EXCLUDED.dealer_id, base_rate=EXCLUDED.base_rate,
+         quarter_rate_1=EXCLUDED.quarter_rate_1, quarter_rate_2=EXCLUDED.quarter_rate_2,
+         quarter_rate_3=EXCLUDED.quarter_rate_3, actual_count=EXCLUDED.actual_count, plan_count=EXCLUDED.plan_count`, [
+                entry.login,
+                dealerResult.rows[0].id,
+                percent(entry.baseRate ?? 0.45),
+                ...quarterRates.map(percent),
+                0,
+                number(entry.plan ?? 0)
+            ]);
             savedEntries.push(entry);
         }
         await client.query('COMMIT');
@@ -177,6 +244,17 @@ async function start() {
       dealer_id INTEGER NOT NULL REFERENCES dealers(id) ON DELETE CASCADE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE dealer_logins ADD COLUMN IF NOT EXISTS base_rate NUMERIC(8,4) NOT NULL DEFAULT 0.45;
+    ALTER TABLE dealer_logins ADD COLUMN IF NOT EXISTS quarter_rate_1 NUMERIC(8,4) NOT NULL DEFAULT 0.60;
+    ALTER TABLE dealer_logins ADD COLUMN IF NOT EXISTS quarter_rate_2 NUMERIC(8,4) NOT NULL DEFAULT 0.65;
+    ALTER TABLE dealer_logins ADD COLUMN IF NOT EXISTS quarter_rate_3 NUMERIC(8,4) NOT NULL DEFAULT 0.70;
+    ALTER TABLE dealer_logins ADD COLUMN IF NOT EXISTS actual_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE dealer_logins ADD COLUMN IF NOT EXISTS plan_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE dealers ADD COLUMN IF NOT EXISTS base_rate NUMERIC(8,4) NOT NULL DEFAULT 0.45;
+    ALTER TABLE dealers ADD COLUMN IF NOT EXISTS quarter_rate_1 NUMERIC(8,4) NOT NULL DEFAULT 0.60;
+    ALTER TABLE dealers ADD COLUMN IF NOT EXISTS quarter_rate_2 NUMERIC(8,4) NOT NULL DEFAULT 0.65;
+    ALTER TABLE dealers ADD COLUMN IF NOT EXISTS quarter_rate_3 NUMERIC(8,4) NOT NULL DEFAULT 0.70;
+    ALTER TABLE dealers ADD COLUMN IF NOT EXISTS plan_count INTEGER NOT NULL DEFAULT 0;
   `);
     app.listen(Number(process.env.PORT ?? 4000), () => console.log('Backend http://localhost:4000'));
 }
