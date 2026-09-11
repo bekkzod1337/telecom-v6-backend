@@ -43,7 +43,7 @@ const multer_1 = __importDefault(require("multer"));
 const XLSX = __importStar(require("xlsx"));
 const pg_1 = require("pg");
 const app = (0, express_1.default)();
-const upload = (0, multer_1.default)({ storage: multer_1.default.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+const upload = (0, multer_1.default)({ storage: multer_1.default.memoryStorage(), limits: { fileSize: 250 * 1024 * 1024 } });
 const pool = new pg_1.Pool({ connectionString: process.env.DATABASE_URL });
 app.use((0, cors_1.default)({ origin: process.env.FRONTEND_URL ?? 'http://localhost:3000' }));
 app.use(express_1.default.json({ limit: '2mb' }));
@@ -58,17 +58,18 @@ const tariffDefaults = {
     'Super Lux': 0.55, 'Super Mini': 0.55, 'Super Bonus': 0.6,
     'Mobile Mini M': 0.55, 'Mobile Elite': 0.7, 'Mobile Lux': 0.7,
     'Optimal': 0.55, 'Farzand': 0.5, 'Mini Voice': 0.55,
-    'Data 1TB': 0.15, 'Uzmobile M2M yil': 0.15
-};
-const bonusBasePrices = {
-    'Bonus Super Salom': 70000,
-    'Bonus Super Lux': 77001,
-    'Bonus Ideal Plus': 85001
+    'Data 1TB': 0.15, 'Data 300GB': 0.15, 'Data 600GB': 0.15, 'Uzmobile M2M yil': 0.15,
 };
 const tariffPrices = {
-    'Super Lux': 77000
+    'Super Lux': 70000, 'Bonus Super Lux': 70000, 'Super Salom': 70000, 'Bonus Super Salom': 70000,
+    'Mobile Lux': 101000, 'Mobile Elite': 150000, 'Ideal Plus': 85000, 'Bonus Ideal Plus': 85000,
+    'Mini Voice': 45000, 'Bayramona 35': 70000, 'Mobile Sport': 70000, Balance: 65000,
+    Optimal: 55000, Farzand: 55000, 'Mobile Mini M': 45000, 'Uzmobile M2M yil': 100000,
+    'Data 300GB': 500000, 'Data 600GB': 900000, 'Data 1TB': 1300000, 'Ideal yil': 770000,
+    'Super Bonus': 70000, 'Super Mini': 45000
 };
 function text(value) { return value == null ? '' : String(value); }
+function normalizeLogin(value) { return text(value).trim().toLowerCase(); }
 function number(value) {
     const source = String(value ?? '').replace(/\s/g, '').replace(',', '.');
     const parsed = typeof value === 'number' ? value : Number(source.replace('%', ''));
@@ -79,13 +80,10 @@ function number(value) {
 function calculate(row) {
     const tariff = text(row['Тарифный план']).trim();
     const currentPayment = number(row['Сумма оплат в день подключения']);
-    const status = text(row['Статус заявки']).trim().toLocaleLowerCase();
-    const waitingForPayment = status === 'ожидание оплаты';
-    const tariffPayment = bonusBasePrices[tariff] ?? tariffPrices[tariff];
-    const payment = tariffPayment !== undefined && (bonusBasePrices[tariff] !== undefined || (waitingForPayment && currentPayment <= 0))
-        ? tariffPayment : currentPayment;
+    const listedPrice = tariffPrices[tariff];
+    const payment = listedPrice ?? currentPayment;
     const rate = number(row['Комиссия %']);
-    const net = payment / 1.12;
+    const net = tariff === 'Bayrammona 35' ? 62499 : (listedPrice ?? payment) / 1.12;
     const commission = tariff === 'Bonus Super Salom' ? 8000
         : tariff === 'Bonus Super Lux' || tariff === 'Bonus Ideal Plus' ? 12000
             : net * rate;
@@ -99,6 +97,12 @@ function monthOf(value) {
 function percent(value) {
     const parsed = number(value);
     return parsed > 1 ? parsed / 100 : parsed;
+}
+function isAnnualTariff(tariff) {
+    return /(?:^|\s)yil(?:\s|$)/i.test(tariff) || /(?:^|\s)yillik(?:\s|$)/i.test(tariff);
+}
+function isFixedFifteenPercentTariff(tariff) {
+    return new Set(['Data 1TB', 'Data 300GB', 'Data 600GB', 'Uzmobile M2M yil']).has(tariff);
 }
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.post('/api/reestr/import', upload.single('file'), async (req, res) => {
@@ -122,17 +126,18 @@ app.post('/api/reestr/import', upload.single('file'), async (req, res) => {
             result['Komissiya %'] = tariffDefaults[text(result['Тарифный план'])] ?? 0.6;
             return calculate(result);
         }).filter((row) => text(row['Статус заявки']).trim().toLocaleLowerCase() !== 'ожидание оплаты');
-        const loginValues = [...new Set(rows.map((row) => text(row['Логин']).trim()).filter(Boolean))];
+        const loginValues = [...new Set(rows.map((row) => normalizeLogin(row['Логин'])).filter(Boolean))];
         const dealerByLogin = new Map();
         const settingsByLogin = new Map();
         if (loginValues.length > 0) {
             const dealerResult = await pool.query(`SELECT dl.login, d.name, dl.base_rate, dl.quarter_rate_1, dl.quarter_rate_2, dl.quarter_rate_3, dl.actual_count, d.plan_count
          FROM dealer_logins dl
          INNER JOIN dealers d ON d.id = dl.dealer_id
-         WHERE dl.login = ANY($1::text[])`, [loginValues]);
+         WHERE lower(dl.login) = ANY($1::text[])`, [loginValues]);
             for (const item of dealerResult.rows) {
-                dealerByLogin.set(item.login, item.name);
-                settingsByLogin.set(item.login, {
+                const login = normalizeLogin(item.login);
+                dealerByLogin.set(login, item.name);
+                settingsByLogin.set(login, {
                     baseRate: Number(item.base_rate), quarterRates: [Number(item.quarter_rate_1), Number(item.quarter_rate_2), Number(item.quarter_rate_3)],
                     plan: Number(item.plan_count), actual: Number(item.actual_count)
                 });
@@ -140,18 +145,22 @@ app.post('/api/reestr/import', upload.single('file'), async (req, res) => {
         }
         const facts = new Map();
         for (const row of rows) {
-            const login = text(row['Логин']).trim();
+            const login = normalizeLogin(row['Логин']);
             const dealer = dealerByLogin.get(login);
             if (dealer)
                 facts.set(dealer, (facts.get(dealer) ?? 0) + number(row['Сони'] || 1));
         }
         for (const row of rows) {
-            const login = text(row['Логин']).trim();
-            const dealer = dealerByLogin.get(login) ?? '';
+            const login = normalizeLogin(row['Логин']);
+            const dealer = dealerByLogin.get(login) ?? text(row['Логин']).trim();
             const settings = settingsByLogin.get(login);
             const fact = facts.get(dealer) ?? settings?.actual ?? 0;
-            const rate = settings && settings.plan > 0 && fact >= settings.plan
-                ? settings.quarterRates[(monthOf(row['Дата подключения']) - 1) % 3] : settings?.baseRate;
+            const tariff = text(row['Тарифный план']).trim();
+            const monthRateTariff = tariff === 'Super Lux' || tariff === 'Bonus Super Lux';
+            const planCompleted = settings && settings.plan > 0 && fact >= settings.plan;
+            const rate = isFixedFifteenPercentTariff(tariff) ? 0.15
+                : settings && ((monthRateTariff && planCompleted) || (isAnnualTariff(tariff) && planCompleted))
+                    ? settings.quarterRates[(monthOf(row['Дата подключения']) - 1) % 3] : settings?.baseRate;
             row['Diler nomi'] = dealer;
             row['Asl foiz'] = settings?.baseRate ?? null;
             row['1-oy foiz'] = settings?.quarterRates[0] ?? null;
